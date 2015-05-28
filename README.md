@@ -17,7 +17,9 @@ Or with a custom mbtiles:
 ## Usage
 
 - double-click anywhere on the map to start creating a polygon
-- then one click = one point into the polygon
+- then double-one click on the = one point into the polygon
+- click-move on a dot = move a point of the polygon
+- double-click on a dot = remove the dot
 - click "Finish" to add the polygon back into the geojson
 
 - double-click on a current geojson polygon to edit it
