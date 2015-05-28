@@ -1,5 +1,5 @@
 import json
-from kivy.garden.mapview import MapView, Coordinate
+from kivy.garden.mapview import MapView, Coordinate, MapMarker, MarkerMapLayer
 from kivy.garden.mapview.mapview.mbtsource import MBTilesMapSource
 from kivy.garden.mapview.mapview.geojson import GeoJsonMapLayer
 from kivy.app import App
@@ -39,15 +39,37 @@ Builder.load_string("""
 
     MapView:
         id: mapview
-        map_source: root.map_source
+        map_source: root.map_source or self.map_source
         snap_to_zoom: False
 
+<EditorMarker>:
+    anchor_y: 0.5
+    source: "blue_dot.png"
 """)
+
+class EditorMarker(MapMarker):
+    def on_touch_down(self, touch):
+        ret = super(EditorMarker, self).on_touch_down(touch)
+        if ret and touch.is_double_tap:
+            self.editor.remove_marker(self)
+            return False
+        return ret
+
+    def on_touch_move(self, touch):
+        ret = super(EditorMarker, self).on_touch_move(touch)
+        if ret:
+            coord = self.mapview.get_latlon_at(*touch.pos)
+            self.lon = coord.lon
+            self.lat = coord.lat
+            self.mapview.trigger_update(False)
+            self.editor._update_geojson()
+        return ret
 
 
 class Editor(GridLayout):
-    current_path = None
     current_layer = None
+    edit_last_move = None
+    markers = []
     mode = StringProperty("polygon")
     is_editing = BooleanProperty(False)
     map_source = ObjectProperty()
@@ -56,12 +78,14 @@ class Editor(GridLayout):
 
     def __init__(self, **kwargs):
         super(Editor, self).__init__(**kwargs)
+        self.marker_layer = MarkerMapLayer()
         self.current_layer = GeoJsonMapLayer()
         self.result_layer = GeoJsonMapLayer()
         self.result_layer.geojson = kwargs["geojson"]
         self.geojson_fn = kwargs["geojson_fn"]
         self.ids.mapview.add_widget(self.current_layer)
         self.ids.mapview.add_widget(self.result_layer)
+        self.ids.mapview.add_widget(self.marker_layer)
 
     def on_touch_down(self, touch):
         if self.ids.mapview.collide_point(*touch.pos):
@@ -70,14 +94,23 @@ class Editor(GridLayout):
                 if feature:
                     self.edit_feature(feature)
                 else:
+                    touch.grab(self)
                     self.forward_to_object(touch)
                 return True
-            elif self.is_editing:
+            elif touch.is_double_tap and self.is_editing:
+                if self.remove_marker_at(touch):
+                    return True
+                touch.grab(self)
                 return self.forward_to_object(touch)
             elif not self.is_editing:
-                print self.select_feature(*touch.pos)
+                self.select_feature(*touch.pos)
             return self.ids.mapview.on_touch_down(touch)
         return super(Editor, self).on_touch_down(touch)
+
+    def on_touch_move(self, touch):
+        if touch.grab_current == self and self.is_editing:
+            return self.forward_to_object(touch, move=True)
+        return super(Editor, self).on_touch_move(touch)
 
     def switch_mode(self):
         if self.is_editing:
@@ -85,27 +118,54 @@ class Editor(GridLayout):
             return
         self.mode = "line" if self.mode == "polygon" else "polygon"
 
-    def forward_to_object(self, touch):
+    def forward_to_object(self, touch, move=False):
         mapview = self.ids.mapview
         if not self.is_editing:
             self.is_editing = True
-            self.current_path = []
+            self.clear_markers()
+        coord = mapview.get_latlon_at(*touch.pos)
+        if move:
+            m = self.markers[-1]
         else:
-            coord = mapview.get_latlon_at(*touch.pos)
-            self.current_path.append(coord)
-            self._update_geojson()
+            m = EditorMarker()
+            m.mapview = mapview
+            m.editor = self
+            self.markers.append(m)
+            self.marker_layer.add_widget(m)
+            self.marker_layer.reposition()
+        m.lat = coord.lat
+        m.lon = coord.lon
+        self._update_geojson()
         return True
 
+    def clear_markers(self):
+        while self.markers:
+            self.remove_marker(self.markers.pop())
+
+    def remove_marker(self, m):
+        m.mapview = m.editor = None
+        self.marker_layer.remove_widget(m)
+        if m in self.markers:
+            self.markers.remove(m)
+        self._update_geojson()
+
+    def remove_marker_at(self, touch):
+        pos = self.ids.mapview.to_local(*touch.pos)
+        for marker in self.markers[:]:
+            if marker.collide_point(*pos):
+                self.remove_marker(marker)
+                return True
+
     def finalize_object(self):
-        if self.current_path:
+        if self.markers:
             geojson = self.current_layer.geojson
             if "properties" not in geojson:
                 geojson["properties"] = {"title": self.title}
             else:
                 geojson["properties"]["title"] = self.title
-            self.result_layer.geojson["features"].append(geojson)
+            self.result_layer.geojson["features"].extend(geojson["features"])
             self.ids.mapview.trigger_update(True)
-        self.current_path = None
+        self.clear_markers()
         self.is_editing = False
         self.title = ""
         self._update_geojson()
@@ -115,18 +175,29 @@ class Editor(GridLayout):
             json.dump(self.result_layer.geojson, fd)
 
     def _update_geojson(self):
-        geometry = {"type": ""}
-        if self.current_path:
-            if self.mode == "polygon":
-                geometry["coordinates"] = [[[c.lon, c.lat]
-                                            for c in self.current_path]]
-                geometry["type"] = "Polygon"
-            else:
-                geometry["coordinates"] = [[c.lon, c.lat]
-                                           for c in self.current_path]
-                geometry["type"] = "LineString"
-        geojson = {"type": "Feature", "properties": {}, "geometry": geometry}
+        features = []
+        if self.mode == "polygon":
+            geotype = "Polygon"
+            geocoords = lambda x: [x]
+        else:
+            geotype = "LineString"
+            geocoords = lambda x: x
+
+        # current commited path
+        if self.markers:
+            coordinates = [[c.lon, c.lat] for c in self.markers]
+            features.append({
+                "type": "Feature",
+                "properties": {},
+                "geometry": {
+                    "type": geotype,
+                    "coordinates": geocoords(coordinates)
+                }
+            })
+
+        geojson = {"type": "FeatureCollection", "features": features}
         self.current_layer.geojson = geojson
+        self.ids.mapview.trigger_update(True)
 
     def point_inside_polygon(self, x, y, poly):
         n = len(poly)
@@ -149,16 +220,25 @@ class Editor(GridLayout):
                 continue
             geometry = feature["geometry"]
             if geometry["type"] == "Polygon":
-                if self.point_inside_polygon(coord.lon, coord.lat, geometry["coordinates"][0]):
+                if self.point_inside_polygon(coord.lon, coord.lat,
+                                             geometry["coordinates"][0]):
                     return feature
 
     def edit_feature(self, feature):
         self.result_layer.geojson["features"].remove(feature)
-        self.current_layer.geojson = feature
+        #self.current_layer.geojson = feature
         self.ids.mapview.trigger_update(True)
         self.title = feature.get("properties", {}).get("title", "")
         self.is_editing = True
-        self.current_path = [Coordinate(lon=c[0], lat=c[1]) for c in feature["geometry"]["coordinates"][0]]
+        self.clear_markers()
+        for c in feature["geometry"]["coordinates"][0]:
+            m = EditorMarker(lon=c[0], lat=c[1])
+            m.mapview = self.ids.mapview
+            m.editor = self
+            self.marker_layer.add_widget(m)
+            self.markers.append(m)
+        self._update_geojson()
+
 
 class GeojsonEditor(App):
     mbtiles_fn = None
