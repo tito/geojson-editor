@@ -160,9 +160,9 @@ class Editor(GridLayout):
         if self.markers:
             geojson = self.current_layer.geojson
             if "properties" not in geojson:
-                geojson["properties"] = {"title": self.title}
+                geojson["features"][0]["properties"] = {"title": self.title}
             else:
-                geojson["properties"]["title"] = self.title
+                geojson["features"][0]["properties"]["title"] = self.title
             self.result_layer.geojson["features"].extend(geojson["features"])
             self.ids.mapview.trigger_update(True)
         self.clear_markers()
